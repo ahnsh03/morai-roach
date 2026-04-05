@@ -19,33 +19,37 @@ Roach 논문 (carla-roach)의 chauffeurnet.py BEV 표현 방식을 그대로 따
   Roach 원본의 _get_mask_from_stopline_vtx()와 동일하게
   stopline을 cv.line()으로 BEV에 렌더링한다.
 
-채널 구성 (Roach 원본과 동일):
-  masks shape: (3 * len(history_idx), H, W)
-    = [vehicle_t-3, vehicle_t-2, vehicle_t-1, vehicle_t-0,
-       walker_t-3,  walker_t-2,  walker_t-1,  walker_t-0,
-       tl_t-3,      tl_t-2,      tl_t-1,      tl_t-0]
+채널 구성 — carla-roach chauffeurnet.py와 동일 순서 (총 3 + 3*K, K=len(history_idx), 기본 15채널):
+  masks shape: (3 + 3*K, H, W) uint8
+    [road, route, lane,
+     vehicle 히스토리 K장,
+     walker 히스토리 K장,
+     traffic_light(+stop) 히스토리 K장]
+
+  - road: KATRI 맵 H5(morai_katri_map.h5 등)에 'road' 레이어가 있으면 CARLA와 동일 방식으로 워핑.
+          H5가 없으면 해당 채널은 0.
+  - route: update(..., route_world_xy=) 로 주입한 웨이포인트(세계 좌표) 폴리라인. 없으면 0.
+  - lane: JSON 차선(실선 255 / 점선 120).
 
 좌표계 가정 (MORAI):
   - 세계 좌표: x=동쪽(East), y=북쪽(North)  [ENU 좌표계]
   - yaw/heading: 동쪽(East)축 기준, 반시계 방향 양수 (degrees)
-  - 이 가정이 맞지 않으면 _get_warp_transform() 수정 필요
+  - H5 road 워핑은 CARLA와 같이 맵 픽셀 + world_offset_in_meters 를 사용한다.
 
-참고:
-  - 정적 데이터(도로, 경로, 차선)는 현재 미구현 (시뮬레이션 측 이슈)
+설치: 저장소 루트에서 pip install -e . (network, morai_gym import)
 """
 
+from __future__ import annotations
+
 import json
+import h5py
 import numpy as np
 import cv2 as cv
 from collections import deque
 from dataclasses import replace
 from typing import List, Optional, Dict, Tuple
 
-import sys
 from pathlib import Path
-_project_root = Path(__file__).resolve().parents[4]
-if str(_project_root) not in sys.path:
-    sys.path.insert(0, str(_project_root))
 
 from network.UDP.protocol import (
     ObjectData, TrafficLightData, EgoState,
@@ -191,19 +195,17 @@ class TrafficLightStoplineMapper:
 
 
 class BEVDynamicRenderer:
-    """동적 객체(차량, 보행자, 신호등)를 BEV 이미지에 마스킹하는 렌더러.
+    """동적·정적 BEV 마스크 (carla-roach chauffeurnet 관측 contract 정합).
 
     사용법:
-        from morai_gym.lib.core.birdiview.bev_render import BEVDynamicRenderer
+        from morai_gym.core.obs_manager.birdview.bev_render import BEVDynamicRenderer
 
-        renderer = BEVDynamicRenderer()   # 기본값 사용
-        # 또는
-        renderer = BEVDynamicRenderer.from_config(config)  # Config 객체 사용
-
-        # 매 프레임마다:
-        result = renderer.update(ego_state, vehicle_list, pedestrian_list, traffic_light)
-        rendered_image = result['rendered']   # (192, 192, 3) uint8 RGB
-        mask_channels  = result['masks']      # (12, 192, 192) uint8
+        renderer = BEVDynamicRenderer.from_config(config)
+        result = renderer.update(
+            ego_state, vehicle_list, pedestrian_list, traffic_light,
+            route_world_xy=optional_Nx2_array,
+        )
+        result['masks']  # (15, H, W) uint8 — K=4 기본
     """
 
     def __init__(
@@ -222,7 +224,7 @@ class BEVDynamicRenderer:
         tl_red_val: int = 255,
         default_veh_size: tuple = (4.5, 2.0),
         default_ped_size: tuple = (0.5, 0.5),
-        tl_mapper: Optional['TrafficLightStoplineMapper'] = None,
+        tl_mapper: Optional[TrafficLightStoplineMapper] = None,
         lane_markings: Optional[List[Dict]] = None,
         lane_max_range: float = 50.0,
         lane_thickness: int = 2,
@@ -231,6 +233,9 @@ class BEVDynamicRenderer:
         link_data: Optional[List[Dict]] = None,
         link_max_range: float = 50.0,
         link_thickness: int = 1,
+        static_h5_path: Optional[str] = None,
+        max_route_waypoints: int = 80,
+        route_line_thickness: int = 16,
     ):
         """
         Args:
@@ -291,15 +296,103 @@ class BEVDynamicRenderer:
         self._link_max_range = link_max_range
         self._link_thickness = link_thickness
 
+        self._max_route_wps = int(max_route_waypoints)
+        self._route_thickness = int(route_line_thickness)
+
+        self._h5_road: Optional[np.ndarray] = None
+        self._h5_world_offset: Optional[np.ndarray] = None
+        self._road_ppm: float = float(pixels_per_meter)
+        self._try_load_static_h5(static_h5_path)
+
+    def _try_load_static_h5(self, static_h5_path: Optional[str]) -> None:
+        if not static_h5_path:
+            return
+        p = Path(static_h5_path)
+        if not p.is_file():
+            print(f'[BEVDynamicRenderer] WARNING: H5 없음 — road 채널은 0: {static_h5_path}')
+            return
+        try:
+            with h5py.File(str(p), 'r', libver='latest', swmr=True) as hf:
+                if 'road' not in hf:
+                    print(f'[BEVDynamicRenderer] WARNING: H5에 road 키 없음: {p}')
+                    return
+                self._h5_road = np.array(hf['road'], dtype=np.uint8)
+                self._h5_world_offset = np.array(
+                    hf.attrs['world_offset_in_meters'], dtype=np.float32)
+                self._road_ppm = float(hf.attrs.get('pixels_per_meter', self._ppm))
+            if not np.isclose(self._road_ppm, self._ppm, rtol=0.01, atol=0.01):
+                print(
+                    f'[BEVDynamicRenderer] WARNING: H5 pixels_per_meter={self._road_ppm} '
+                    f'!= config {self._ppm} — road 워핑은 H5 기준 ppm 사용'
+                )
+            print(f'[BEVDynamicRenderer] Static road H5 로드: {p}')
+        except Exception as e:
+            print(f'[BEVDynamicRenderer] WARNING: H5 로드 실패 — road=0: {e}')
+            self._h5_road = None
+            self._h5_world_offset = None
+
+    def _affine_bev_from_ego_map_px(
+            self, ego_x: float, ego_y: float, ego_yaw_deg: float) -> np.ndarray:
+        """CARLA chauffeurnet._get_warp_transform — 맵 픽셀 좌표 기준 BEV 아핀 (2×3)."""
+        ox, oy = float(self._h5_world_offset[0]), float(self._h5_world_offset[1])
+        ppm = self._road_ppm
+        ev_px = np.array(
+            [ppm * (ego_x - ox), ppm * (ego_y - oy)], dtype=np.float32)
+        yaw = np.deg2rad(ego_yaw_deg)
+        forward_vec = np.array([np.cos(yaw), np.sin(yaw)], dtype=np.float32)
+        right_vec = np.array(
+            [np.cos(yaw + 0.5 * np.pi), np.sin(yaw + 0.5 * np.pi)],
+            dtype=np.float32)
+        w = float(self._width)
+        ev_b = float(self._ev_to_bottom)
+        bottom_left = ev_px - ev_b * forward_vec - 0.5 * w * right_vec
+        top_left = ev_px + (w - ev_b) * forward_vec - 0.5 * w * right_vec
+        top_right = ev_px + (w - ev_b) * forward_vec + 0.5 * w * right_vec
+        src_pts = np.stack((bottom_left, top_left, top_right), axis=0).astype(np.float32)
+        dst_pts = np.array(
+            [[0, self._width - 1], [0, 0], [self._width - 1, 0]],
+            dtype=np.float32)
+        return cv.getAffineTransform(src_pts, dst_pts)
+
+    def _get_road_mask(self, ego_x: float, ego_y: float, ego_yaw_deg: float) -> np.ndarray:
+        out = np.zeros((self._width, self._width), dtype=np.uint8)
+        if self._h5_road is None or self._h5_world_offset is None:
+            return out
+        m_map = self._affine_bev_from_ego_map_px(ego_x, ego_y, ego_yaw_deg)
+        warped = cv.warpAffine(self._h5_road, m_map, (self._width, self._width))
+        out[warped > 0] = np.uint8(255)
+        return out
+
+    def _get_route_mask_world(
+            self,
+            _ego_state: EgoState,
+            M_warp: np.ndarray,
+            route_world_xy: Optional[np.ndarray],
+    ) -> np.ndarray:
+        """세계 좌표 웨이포인트 경로 — 차선과 동일 아핀(M_warp, 미터 기준)."""
+        mask = np.zeros([self._width, self._width], dtype=np.uint8)
+        if route_world_xy is None or len(route_world_xy) < 2:
+            return mask
+        rw = np.asarray(route_world_xy, dtype=np.float32)
+        if rw.ndim != 2 or rw.shape[1] < 2:
+            return mask
+        n = min(rw.shape[0], self._max_route_wps)
+        pts = rw[:n, :2].reshape(-1, 1, 2).astype(np.float32)
+        pts_bev = cv.transform(pts, M_warp)
+        pts_bev = np.ascontiguousarray(np.round(pts_bev).astype(np.int32))
+        cv.polylines(
+            mask, [pts_bev], isClosed=False,
+            color=255, thickness=self._route_thickness)
+        return mask
+
     # ───────────────────────────────────────────────────────────────
     # 팩토리 메서드
     # ───────────────────────────────────────────────────────────────
 
     @classmethod
     def from_config(cls, config):
-        """map_to_h5.py의 Config 객체로부터 렌더러를 생성한다."""
-        # 신호등 ↔ 정지선 매퍼 생성 (JSON 파일이 존재할 때만)
-        map_dir = Path(config.root) / 'morai_gym' / 'lib' / 'core' / 'birdiview' / 'map'
+        """map_to_h5.Config 로부터 렌더러를 생성한다."""
+        map_dir = Path(config.root) / 'morai_gym' / 'core' / 'obs_manager' / 'birdview' / 'map'
         tl_json = map_dir / 'traffic_light_set.json'
         sl_json = map_dir / 'stoplane_marking_set.json'
 
@@ -319,7 +412,6 @@ class BEVDynamicRenderer:
         else:
             print(f'[BEVDynamicRenderer] WARNING: lane_marking_set.json not found, lane rendering disabled.')
 
-            # ── link_set.json 로드 추가 ──
         link_json = map_dir / 'link_set.json'
         link_data = []
         if link_json.exists():
@@ -347,12 +439,15 @@ class BEVDynamicRenderer:
             tl_mapper=tl_mapper,
             lane_markings=lane_markings,
             lane_max_range=50.0,
-            lane_thickness=int(getattr(config, 'route_thick', 2)),
+            lane_thickness=2,
             lane_solid_value=config.lane_solid,
             lane_broken_value=config.lane_broken,
             link_data=link_data,
             link_max_range=50.0,
             link_thickness=1,
+            static_h5_path=getattr(config, 'static_h5', None),
+            max_route_waypoints=config.max_wps,
+            route_line_thickness=config.route_thick,
         )
 
     # ═══════════════════════════════════════════════════════════════
@@ -365,6 +460,7 @@ class BEVDynamicRenderer:
         vehicle_list: List[ObjectData],
         pedestrian_list: List[ObjectData],
         traffic_light: Optional[TrafficLightData],
+        route_world_xy: Optional[np.ndarray] = None,
     ) -> dict:
         """현재 프레임 데이터를 히스토리에 추가하고 BEV를 렌더링한다.
 
@@ -373,15 +469,13 @@ class BEVDynamicRenderer:
             vehicle_list: 주변 차량 리스트 (UdpManager.vehicle_list).
             pedestrian_list: 보행자 리스트 (UdpManager.pedestrian_list).
             traffic_light: 신호등 상태 (UdpManager.traffic_light). None 가능.
+            route_world_xy: (N, 2) 이상 — 세계 좌표 경로 웨이포인트. 없으면 route 채널은 0.
 
         Returns:
             dict:
                 'rendered': (H, W, 3) uint8 — RGB 시각화 이미지.
-                'masks': (C, H, W) uint8 — 마스크 채널.
-                    C = 3 × len(history_idx).
-                    [vehicle_history..., walker_history..., tl_history...].
-                    vehicle/walker: 0 또는 255.
-                    tl: 0 / 80(green) / 170(yellow) / 255(red).
+                'masks': (3 + 3*K, H, W) uint8 — K=len(history_idx).
+                    순서: road, route, lane, vehicle×K, walker×K, tl×K.
         """
         # ── 1) 거리 기반 필터링 ──
         vehicles = self._filter_by_distance(
@@ -414,24 +508,29 @@ class BEVDynamicRenderer:
         vehicle_masks, walker_masks, tl_masks = self._get_history_masks(
             M_warp, ego_state)
 
-        # ── 7) 차선 마스크 생성 및 RGB에 오버레이 ──
-        lane_mask = self._get_lane_mask(ego_state)
+        # ── 7) 정적 채널 (carla chauffeurnet 순서: road, route, lane) ──
+        c_road = self._get_road_mask(
+            ego_state.pos_x, ego_state.pos_y, ego_state.yaw)
+        c_route = self._get_route_mask_world(
+            ego_state, M_warp, route_world_xy)
+        c_lane = self._get_lane_mask(ego_state)
 
-        # ── 7-1) 도로 링크 마스크 생성 ── 
-        link_mask = self._get_link_mask(ego_state)  
+        # ── 7-1) 도로 링크 — RGB 시각화 전용 (masks에는 미포함, CARLA와 동일 15채널 유지)
+        link_mask = self._get_link_mask(ego_state)
 
         rendered = self._render_rgb(
-            vehicle_masks, walker_masks, tl_masks, lane_mask, link_mask, ego_state, M_warp)
+            vehicle_masks, walker_masks, tl_masks, lane_mask=c_lane,
+            link_mask=link_mask, ego_state=ego_state, M_warp=M_warp)
 
-        # ── 8) 출력 마스크 채널 조합 ──
+        # ── 8) masks: road, route, lane, vehicles..., walkers..., tls...
         c_vehicle = [m.astype(np.uint8) * 255 for m in vehicle_masks]
         c_walker = [m.astype(np.uint8) * 255 for m in walker_masks]
-        c_tl = tl_masks  # 이미 uint8 밝기값
-        c_lane = lane_mask.astype(np.uint8)
-        c_link = link_mask.astype(np.uint8)  
-
-
-        masks = np.stack((*c_vehicle, *c_walker, *c_tl, c_lane, c_link), axis=0)
+        c_tl = tl_masks
+        k = len(self._history_idx)
+        masks = np.stack(
+            (c_road, c_route, c_lane, *c_vehicle, *c_walker, *c_tl),
+            axis=0)
+        assert masks.shape[0] == 3 + 3 * k, (masks.shape[0], k)
 
         return {'rendered': rendered, 'masks': masks}
 
@@ -506,16 +605,16 @@ class BEVDynamicRenderer:
                 })
         return links
 
-    def _get_lane_mask(self, ego_state: EgoState):
+    def _get_lane_mask(self, ego_state: EgoState) -> np.ndarray:
         """Ego 주변의 차선을 BEV 마스크에 렌더링한다.
-        
-        마스크 값:
-          - 255 (흰색): 실선(Solid)
-          - 120 (회색): 점선(Broken/Dashed)
+
+        마스크 값 (uint8):
+          - 255: 실선(Solid)
+          - 120: 점선(Broken/Dashed)
         """
         mask = np.zeros([self._width, self._width], dtype=np.uint8)
         if not self._lane_markings or ego_state is None:
-            return mask.astype(bool)
+            return mask
 
         M_warp = self._get_warp_transform(
             ego_state.pos_x, ego_state.pos_y, ego_state.yaw)
@@ -961,7 +1060,7 @@ class BEVDynamicRenderer:
 
         h_len = len(self._history_idx) - 1
 
-            # ── 도로 링크 (가장 먼저 = 배경) ──  ← 추가
+        # 도로 링크 (배경 시각화)
         if link_mask is not None and np.any(link_mask):
             # link_type별 색상 구분
             type1_mask = (link_mask == 200)

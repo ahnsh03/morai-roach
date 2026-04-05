@@ -128,6 +128,6 @@ class BEVRender:
     """BEV 렌더러. 동적 객체 마스킹은 BEVDynamicRenderer에 위임."""
 
     def __init__(self, config):
-        from morai_gym.lib.core.birdiview.bev_render import BEVDynamicRenderer
+        from morai_gym.core.obs_manager.birdview.bev_render import BEVDynamicRenderer
         self.config = config
         self.dynamic_renderer = BEVDynamicRenderer.from_config(config)
